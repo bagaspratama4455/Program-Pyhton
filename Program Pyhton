@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Serial -> Excel logger untuk data timbangan (ESP32 Receiver - Multi Line).
+
+Membaca data berformat "Line: X - Berat: Y" dari Serial Port, menambahkan
+timestamp (Tanggal & Waktu), lalu langsung menyimpan ke file Excel pada kolom
+"Berat Line 1" atau "Berat Line 2" sesuai asal Line pengirim.
+"""
+
+# ============================================================
+#  KONFIGURASI  (ubah bagian ini sesuai kebutuhan)
+# ============================================================
+SERIAL_PORT = "COM9"                 # Windows: "COM3" | Linux: "/dev/ttyUSB0" | Mac: "/dev/cu.usbserial-xxxx"
+BAUDRATE = 115200                    # Harus sama dengan Serial.begin() di ESP32 Receiver
+EXCEL_FILE = "Data_Timbangan.xlsx"   # Nama file output
+SHEET_NAME = "Data Timbangan"        # Nama sheet
+SERIAL_TIMEOUT = 1                   # Detik, batas tunggu per pembacaan baris
+RECONNECT_DELAY = 3                  # Detik, jeda sebelum mencoba konek ulang
+# ============================================================
+
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from zipfile import BadZipFile
+
+import serial
+from serial.tools import list_ports
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font
+
+HEADERS = ["Tanggal", "Waktu", "Berat Line 1", "Berat Line 2"]
+
+# Pola regex untuk menangkap nomor Line (1 atau 2) dan angka Berat
+# Contoh teks dari ESP32: "Line: 1 - Berat: 15.50"
+DATA_RE = re.compile(
+    r"^Line:\s*(\d+)\s*-\s*Berat:\s*([-+]?\d+(?:[.,]\d+)?)\s*(?:kg|g|gr)?$",
+    re.IGNORECASE,
+)
+
+
+# ------------------------------------------------------------
+#  EXCEL
+# ------------------------------------------------------------
+def simpan_excel(wb):
+    """
+    Simpan workbook ke disk secara aman: tulis ke file sementara dulu,
+    baru ganti file asli. Jadi file asli tidak rusak kalau program mati
+    atau listrik putus di tengah proses menyimpan.
+    Return True jika berhasil, False jika gagal.
+    """
+    folder = os.path.dirname(os.path.abspath(EXCEL_FILE))
+    tmp = os.path.join(folder, "~tmp_" + os.path.basename(EXCEL_FILE))
+    try:
+        wb.save(tmp)
+        os.replace(tmp, EXCEL_FILE)
+        return True
+    except PermissionError:
+        print(f"[PERINGATAN] Gagal menyimpan '{EXCEL_FILE}': file sedang dibuka di Excel "
+              f"atau tidak ada izin tulis. Tutup file tersebut; data tetap ditahan "
+              f"di memori dan akan disimpan pada pembacaan berikutnya.")
+    except OSError as e:
+        print(f"[PERINGATAN] Gagal menyimpan '{EXCEL_FILE}': {e}")
+    # Bersihkan file sementara jika ada
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    return False
+
+
+def format_header(ws):
+    """Pastikan baris pertama memiliki header 4 kolom yang rapi."""
+    for idx, judul in enumerate(HEADERS, start=1):
+        sel = ws.cell(row=1, column=idx, value=judul)
+        sel.font = Font(bold=True)
+        sel.alignment = Alignment(horizontal="center")
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 12
+    ws.column_dimensions["C"].width = 15
+    ws.column_dimensions["D"].width = 15
+    ws.freeze_panes = "A2"
+
+
+def siapkan_excel():
+    """Buka file Excel yang sudah ada, atau buat baru lengkap dengan header."""
+    if os.path.exists(EXCEL_FILE):
+        try:
+            wb = load_workbook(EXCEL_FILE)
+        except PermissionError:
+            print(f"[ERROR] File '{EXCEL_FILE}' tidak bisa dibuka (sedang dipakai Excel?). "
+                  f"Tutup dulu file tersebut lalu jalankan ulang program.")
+            sys.exit(1)
+        except (BadZipFile, KeyError, OSError) as e:
+            print(f"[ERROR] File '{EXCEL_FILE}' rusak atau bukan file .xlsx yang valid: {e}")
+            print("        Pindahkan/hapus file itu, atau ganti EXCEL_FILE di bagian konfigurasi.")
+            sys.exit(1)
+
+        ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
+        # Pastikan header sesuai dengan format 4 kolom (Tanggal, Waktu, Berat Line 1, Berat Line 2)
+        format_header(ws)
+        print(f"[INFO] Melanjutkan file yang ada: {EXCEL_FILE} "
+              f"(sudah ada {max(ws.max_row - 1, 0)} baris data)")
+        return wb, ws
+
+    # File belum ada -> buat baru
+    wb = Workbook()
+    ws = wb.active
+    ws.title = SHEET_NAME
+    format_header(ws)
+
+    if not simpan_excel(wb):
+        print(f"[ERROR] Tidak bisa membuat file '{EXCEL_FILE}'. Periksa folder dan izin tulisnya.")
+        sys.exit(1)
+    print(f"[INFO] File baru dibuat: {EXCEL_FILE}")
+    return wb, ws
+
+
+# ------------------------------------------------------------
+#  SERIAL
+# ------------------------------------------------------------
+def tampilkan_port_tersedia():
+    ports = list(list_ports.comports())
+    if ports:
+        print("        Port yang terdeteksi saat ini:")
+        for p in ports:
+            print(f"          - {p.device}  ({p.description})")
+    else:
+        print("        Tidak ada port serial yang terdeteksi. Cek kabel USB dan driver (CP210x/CH340).")
+
+
+def buka_serial():
+    """Coba membuka serial port. Return objek Serial, atau None jika gagal."""
+    try:
+        return serial.Serial(SERIAL_PORT, BAUDRATE, timeout=SERIAL_TIMEOUT)
+    except (serial.SerialException, OSError) as e:
+        pesan = str(e).lower()
+
+        if any(k in pesan for k in ("permission", "access is denied", "denied", "busy")):
+            print(f"[ERROR] Port {SERIAL_PORT} tidak bisa dipakai (sedang digunakan / akses ditolak).")
+            print("        -> Tutup Serial Monitor / Serial Plotter di Arduino IDE (atau program serial lain).")
+            print("        -> Di Linux, pastikan user ada di grup 'dialout': sudo usermod -a -G dialout $USER "
+                  "(lalu logout/login).")
+        elif any(k in pesan for k in ("could not open", "no such file", "cannot find", "not found", "filenotfound")):
+            print(f"[ERROR] Port {SERIAL_PORT} tidak ditemukan.")
+            print("        -> Pastikan ESP32 Receiver tercolok dan SERIAL_PORT di bagian konfigurasi sudah benar.")
+            tampilkan_port_tersedia()
+        else:
+            print(f"[ERROR] Gagal membuka {SERIAL_PORT}: {e}")
+
+        print(f"        Mencoba lagi dalam {RECONNECT_DELAY} detik... (Ctrl+C untuk berhenti)")
+        return None
+
+
+# ------------------------------------------------------------
+#  PROGRAM UTAMA
+# ------------------------------------------------------------
+def main():
+    print("=" * 56)
+    print(f" Serial -> Excel Logger | {SERIAL_PORT} @ {BAUDRATE} baud")
+    print(f" Output: {EXCEL_FILE}")
+    print(" Tekan Ctrl+C untuk berhenti")
+    print("=" * 56)
+
+    wb, ws = siapkan_excel()
+    ser = None
+    belum_tersimpan = 0   # jumlah baris yang sudah di memori tapi belum berhasil ditulis ke disk
+
+    try:
+        while True:
+            # --- Pastikan koneksi serial aktif ---
+            if ser is None:
+                ser = buka_serial()
+                if ser is None:
+                    time.sleep(RECONNECT_DELAY)
+                    continue
+                ser.reset_input_buffer()   # buang sisa data lama / teks boot
+                print(f"[OK] Terhubung ke {SERIAL_PORT}. Menunggu data...")
+
+            # --- Baca satu baris ---
+            try:
+                raw = ser.readline()
+            except (serial.SerialException, OSError) as e:
+                print(f"[ERROR] Koneksi serial terputus (kabel tercabut?): {e}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                print(f"        Mencoba konek ulang dalam {RECONNECT_DELAY} detik...")
+                time.sleep(RECONNECT_DELAY)
+                continue
+
+            if not raw:          # timeout, tidak ada data
+                continue
+
+            teks = raw.decode("utf-8", errors="ignore").strip()
+            if not teks:
+                continue
+
+            # --- Validasi & Ekstraksi: harus sesuai format "Line: X - Berat: Y" ---
+            cocok = DATA_RE.match(teks)
+            if not cocok:
+                print(f"[DIABAIKAN] Format tidak sesuai: {teks!r}")
+                continue
+
+            nomor_line = int(cocok.group(1))
+            berat = float(cocok.group(2).replace(",", "."))
+
+            if nomor_line not in (1, 2):
+                print(f"[DIABAIKAN] Nomor Line tidak valid (harus 1 atau 2): Line {nomor_line}")
+                continue
+
+            # --- Tambah timestamp & arahkan ke kolom Line 1 atau Line 2 ---
+            sekarang = datetime.now()
+            tanggal = sekarang.strftime("%Y-%m-%d")
+            waktu = sekarang.strftime("%H:%M:%S")
+
+            if nomor_line == 1:
+                baris_data = [tanggal, waktu, berat, None]
+            else:
+                baris_data = [tanggal, waktu, None, berat]
+
+            ws.append(baris_data)
+            belum_tersimpan += 1
+
+            if simpan_excel(wb):
+                print(f"[TERSIMPAN] {tanggal} {waktu} | Line {nomor_line} | Berat: {berat}")
+                belum_tersimpan = 0
+            else:
+                print(f"[TERTUNDA] {tanggal} {waktu} | Line {nomor_line} | Berat: {berat} "
+                      f"({belum_tersimpan} baris menunggu disimpan)")
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Dihentikan oleh pengguna.")
+    finally:
+        if ser is not None and ser.is_open:
+            ser.close()
+            print("[INFO] Serial port ditutup.")
+        if belum_tersimpan > 0:
+            print("[INFO] Mencoba menyimpan data yang tertunda...")
+            if simpan_excel(wb):
+                print("[INFO] Data tertunda berhasil disimpan.")
+            else:
+                print(f"[PERINGATAN] {belum_tersimpan} baris terakhir GAGAL disimpan. "
+                      f"Tutup '{EXCEL_FILE}' di Excel lalu jalankan ulang.")
+
+
+if __name__ == "__main__":
+    main()
