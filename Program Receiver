@@ -1,0 +1,38 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// Struktur data ini HARUS SAMA PERSIS dengan Transmitter
+typedef struct struct_message {
+    int line;             // Menyimpan informasi Line (1 atau 2)
+    char weightData[32];  // Menyimpan angka timbangan
+} struct_message;
+
+struct_message myData;
+
+// Fungsi callback saat menerima data[cite: 2]
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  memcpy(&myData, incomingData, sizeof(myData));
+  
+  // Anda dapat mengatur format output sesuai kebutuhan program pembaca di PC
+  // Contoh output: "Line: 1 - Berat: 15.50"
+  Serial.print("Line: ");
+  Serial.print(myData.line);
+  Serial.print(" - Berat: ");
+  Serial.println(myData.weightData);
+}
+
+void setup() {
+  Serial.begin(115200); 
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Gagal inisialisasi ESP-NOW");
+    return;
+  }
+  
+  esp_now_register_recv_cb(OnDataRecv);[cite: 2]
+}
+
+void loop() {
+  // Kosong, menggunakan sistem callback
+}
