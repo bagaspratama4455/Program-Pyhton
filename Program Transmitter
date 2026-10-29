@@ -1,0 +1,141 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// GANTI dengan MAC Address ESP32 Receiver
+uint8_t broadcastAddress[] = {0x00, 0x70, 0x07, 0x7D, 0x44, 0x60};
+
+// Struktur pesan dengan identitas line
+typedef struct struct_message {
+  int line;             // Menyimpan informasi Line (1 atau 2)
+  char weightData[32];  // Menyimpan angka timbangan
+} struct_message;
+
+struct_message myData;
+esp_now_peer_info_t peerInfo;
+
+// Deklarasi Pin
+const int btnLine1 = 32; // Tombol Kuning
+const int btnLine2 = 33; // Tombol Biru
+const int ledLine1 = 25; // Lampu indikator Line 1
+const int ledLine2 = 26; // Lampu indikator Line 2
+
+// Variabel penanda Line yang sedang aktif (Default awal 1)
+int activeLine = 1; 
+
+// Fungsi untuk membuat lampu berkedip
+void blinkLed(int ledPin) {
+  for (int i = 0; i < 2; i++) { // Berkedip 2 kali
+    digitalWrite(ledPin, LOW);  // Matikan lampu
+    delay(150);                 // Jeda 150 ms
+    digitalWrite(ledPin, HIGH); // Nyalakan lampu
+    delay(150);                 // Jeda 150 ms
+  }
+}
+
+// Fungsi Callback ESP-NOW: Tereksekusi SETELAH pengiriman selesai
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) {
+     Serial.println("--> Data berhasil terkirim ke Receiver!");
+     
+     // Panggil fungsi berkedip sesuai dengan Line yang sedang aktif
+     if (activeLine == 1) {
+       blinkLed(ledLine1);
+     } else if (activeLine == 2) {
+       blinkLed(ledLine2);
+     }
+  } else {
+     Serial.println("Gagal mengirim data via ESP-NOW");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Konfigurasi Pin Tombol dengan PULLUP
+  pinMode(btnLine1, INPUT_PULLUP);
+  pinMode(btnLine2, INPUT_PULLUP);
+  
+  // Konfigurasi Pin Lampu
+  pinMode(ledLine1, OUTPUT);
+  pinMode(ledLine2, OUTPUT);
+  
+  // Set default awal ke Line 1
+  digitalWrite(ledLine1, HIGH); // Lampu Line 1 menyala
+  digitalWrite(ledLine2, LOW);  // Lampu Line 2 mati
+  activeLine = 1;
+
+  // Konfigurasi komunikasi ke Timbangan
+  Serial2.begin(9600, SERIAL_8N1, 16, 17, true);
+  Serial.println("Sistem siap! Menunggu data dari tombol Print Timbangan...");
+  Serial.println("Status saat ini: LINE 1 AKTIF");
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Gagal inisialisasi ESP-NOW");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Gagal menambahkan peer Receiver");
+    return;
+  }
+}
+
+void loop() {
+  // 1. Cek jika Tombol Line 1 (Kuning) ditekan
+  if (digitalRead(btnLine1) == LOW) {
+    if (activeLine != 1) { // Hanya proses jika statusnya berubah
+      activeLine = 1;
+      digitalWrite(ledLine1, HIGH);
+      digitalWrite(ledLine2, LOW);
+      Serial.println(">> Beralih ke LINE 1 <<");
+    }
+    delay(200); // Debounce sederhana
+  }
+
+  // 2. Cek jika Tombol Line 2 (Biru) ditekan
+  if (digitalRead(btnLine2) == LOW) {
+    if (activeLine != 2) { // Hanya proses jika statusnya berubah
+      activeLine = 2;
+      digitalWrite(ledLine2, HIGH);
+      digitalWrite(ledLine1, LOW);
+      Serial.println(">> Beralih ke LINE 2 <<");
+    }
+    delay(200); // Debounce sederhana
+  }
+
+  // 3. Menunggu kiriman data saat tombol "Print" di Timbangan ditekan
+  if (Serial2.available()) {
+    String rawData = Serial2.readStringUntil('\n');
+    rawData.trim();
+
+    if (rawData.length() > 0) {
+      String cleanWeight = rawData;
+      cleanWeight.replace("WTST", ""); 
+      cleanWeight.replace("WTUS", ""); 
+      cleanWeight.replace("g", "");    
+      cleanWeight.trim();              
+      
+      // Jika data valid (tidak kosong), langsung kirim
+      if (cleanWeight.length() > 0) {
+          myData.line = activeLine; 
+          strncpy(myData.weightData, cleanWeight.c_str(), sizeof(myData.weightData));
+          
+          Serial.print("Menerima Print Timbangan. Mengirim sebagai Line ");
+          Serial.print(myData.line);
+          Serial.print(" | Berat: ");
+          Serial.println(myData.weightData);
+          
+          // Mengirim data. Jika sukses, callback OnDataSent akan tereksekusi
+          esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+      }
+    }
+  }
+}
